@@ -1,0 +1,8 @@
+services:
+  benchmark:
+    build: .
+    environment:
+      - RUN_MODE=${RUN_MODE:-local}
+    volumes:
+      # Persist results on the host so my_test.py can read and upload them
+      - ./results:/app/results
