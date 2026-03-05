@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:bookworm AS builder
+FROM rust:latest-bookworm AS builder
 WORKDIR /usr/src/app
 
 # Copy source and build the release binary
@@ -8,11 +8,17 @@ RUN cargo install --path .
 
 # Run stage
 FROM debian:bookworm-slim
-# Install CA certificates required for HTTPS requests to AWS S3
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+# Install CA certificates, AWS CLI, and util-linux (lscpu)
+RUN apt-get update && \
+    apt-get install -y ca-certificates awscli util-linux && \
+    rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app/results
+WORKDIR /app
 COPY --from=builder /usr/src/app/target/release/my_experiment /usr/local/bin/my_experiment
+COPY collect_hardware.sh /app/collect_hardware.sh
+COPY my_test.sh /app/my_test.sh
 
-# The executable will use environment variables passed by docker-compose or AWS Batch
-ENTRYPOINT ["my_experiment"]
+RUN chmod +x /app/collect_hardware.sh /app/my_test.sh
+
+# my_test.sh orchestrates: hardware collection -> experiment -> S3 upload
+ENTRYPOINT ["/app/my_test.sh"]
