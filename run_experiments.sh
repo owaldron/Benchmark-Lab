@@ -22,6 +22,7 @@ JOB_QUEUE="${BATCH_JOB_QUEUE:-benchmark-gpu-queue}"
 VCPUS="${BATCH_VCPUS:-}"
 MEMORY="${BATCH_MEMORY:-}"
 GPUS="${BATCH_GPUS:-}"
+ECR_REPO_URI="${ECR_REPO:-}"
 
 # Parse CLI arguments (override config values)
 while [[ "$#" -gt 0 ]]; do
@@ -29,6 +30,7 @@ while [[ "$#" -gt 0 ]]; do
         --mode) MODE="$2"; shift ;;
         --bucket) BUCKET="$2"; shift ;;
         --region) REGION="$2"; shift ;;
+        --ecr-repo) ECR_REPO_URI="$2"; shift ;;
         --job-def) JOB_DEF="$2"; shift ;;
         --queue) JOB_QUEUE="$2"; shift ;;
         --vcpus) VCPUS="$2"; shift ;;
@@ -41,6 +43,11 @@ done
 
 if [ -z "$BUCKET" ] && [ "$MODE" == "batch" ]; then
     echo "Error: --bucket is required for batch mode."
+    exit 1
+fi
+
+if [ -z "$ECR_REPO_URI" ] && [ "$MODE" == "batch" ]; then
+    echo "Error: ECR_REPO must be set in config.env or passed via --ecr-repo for batch mode."
     exit 1
 fi
 
@@ -87,8 +94,61 @@ if [ "$MODE" == "local" ]; then
     fi
 
 elif [ "$MODE" == "batch" ]; then
+    echo "Starting batch benchmark run..."
+
+    # --- Build and push Docker image to ECR ---
+    IMAGE_TAG="$RUN_KEY"
+    IMAGE_URI="$ECR_REPO_URI:$IMAGE_TAG"
+
+    echo "Authenticating with ECR..."
+    # Extract the ECR registry (everything before the first /)
+    ECR_REGISTRY="${ECR_REPO_URI%%/*}"
+    aws ecr get-login-password --region "$REGION" \
+        | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+    echo "Building Docker image: $IMAGE_URI"
+    # Ensure we build for linux/amd64 since AWS Batch compute environments are typically x86_64
+    docker build --platform linux/amd64 -t "$IMAGE_URI" "$EXPERIMENT_DIR"
+
+    echo "Pushing image to ECR..."
+    docker push "$IMAGE_URI"
+    echo "Image pushed successfully."
+
     echo "Submitting benchmark job to AWS Batch..."
-    
+
+    # Register a new job definition revision with the pushed image
+    echo "Registering new job definition revision with image: $IMAGE_URI"
+    TEMP_DEF=$(mktemp)
+    TEMP_REG=$(mktemp)
+    aws batch describe-job-definitions \
+        --job-definition-name "${JOB_DEF%%:*}" \
+        --status ACTIVE \
+        --region "$REGION" \
+        --query 'jobDefinitions | sort_by(@, &revision) | [-1]' \
+        --output json > "$TEMP_DEF"
+
+    # Update image and extract only the fields needed for registration
+    jq --arg IMAGE "$IMAGE_URI" '
+        .containerProperties.image = $IMAGE
+        | {
+            jobDefinitionName: .jobDefinitionName,
+            type: .type,
+            containerProperties: .containerProperties
+          }
+        | if .retryStrategy then . + {retryStrategy: .retryStrategy} else . end
+        | if .timeout then . + {timeout: .timeout} else . end
+        | if .platformCapabilities then . + {platformCapabilities: .platformCapabilities} else . end
+    ' "$TEMP_DEF" > "$TEMP_REG"
+
+    NEW_JOB_DEF_ARN=$(aws batch register-job-definition \
+        --region "$REGION" \
+        --cli-input-json "file://$TEMP_REG" \
+        --query 'jobDefinitionArn' \
+        --output text)
+    rm -f "$TEMP_DEF" "$TEMP_REG"
+
+    echo "Registered new job definition: $NEW_JOB_DEF_ARN"
+
     # Build resource requirements array for container overrides
     RESOURCE_REQS=""
     if [[ -n "$VCPUS" ]]; then
@@ -122,7 +182,7 @@ elif [ "$MODE" == "batch" ]; then
     aws batch submit-job \
         --job-name "benchmark-run-$(date +%s)" \
         --job-queue "$JOB_QUEUE" \
-        --job-definition "$JOB_DEF" \
+        --job-definition "$NEW_JOB_DEF_ARN" \
         --region "$REGION" \
         --container-overrides "$CONTAINER_OVERRIDES"
     

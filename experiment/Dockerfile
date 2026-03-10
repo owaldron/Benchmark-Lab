@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:latest-bookworm AS builder
+FROM rust:1-bookworm AS builder
 WORKDIR /usr/src/app
 
 # Copy source and build the release binary
